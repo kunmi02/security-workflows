@@ -1,0 +1,170 @@
+name: Port finding triage
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repository:
+        description: Onboarded target repository (owner/name)
+        type: string
+        required: true
+      issue_number:
+        description: GitHub issue number for single-issue triage
+        type: string
+        required: false
+      issue_numbers:
+        description: Optional JSON array of issue numbers for batch triage
+        type: string
+        required: false
+      decision:
+        description: Reviewer decision
+        type: choice
+        options: [false-positive, remediate]
+        required: true
+      reason:
+        description: Reviewer decision rationale
+        type: string
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: port-dependency-scan-${{ inputs.target_repository }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      owner: ${{ steps.target.outputs.owner }}
+      repo: ${{ steps.target.outputs.repo }}
+      directory: ${{ steps.target.outputs.directory }}
+      issues: ${{ steps.parse.outputs.issues }}
+    steps:
+      - name: Validate target repository
+        id: target
+        shell: bash
+        env:
+          TARGET: ${{ inputs.target_repository }}
+          REPOSITORIES: ${{ vars.SECURITY_SCAN_REPOSITORIES }}
+        run: |
+          [[ "$TARGET" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          directory=$(jq -er --arg target "$TARGET" '.[$target] | strings' <<< "$REPOSITORIES")
+          [[ "$directory" == "." || "$directory" =~ ^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$ ]]
+          echo "owner=${TARGET%/*}" >> "$GITHUB_OUTPUT"
+          echo "repo=${TARGET#*/}" >> "$GITHUB_OUTPUT"
+          echo "directory=$directory" >> "$GITHUB_OUTPUT"
+      - id: parse
+        shell: bash
+        env:
+          SINGLE: ${{ inputs.issue_number }}
+          BATCH: ${{ inputs.issue_numbers }}
+        run: |
+          if [[ -n "$BATCH" && -n "$SINGLE" ]]; then
+            echo "::error::Supply either issue_number or issue_numbers."
+            exit 1
+          fi
+          if [[ -z "$BATCH" ]]; then
+            BATCH=$(jq -cn --arg issue "$SINGLE" '[$issue]')
+          fi
+          issues=$(jq -ce '
+            if type != "array" or length < 1 or length > 20 then error("Select 1–20 issues") else . end
+            | map(tostring | if test("^[1-9][0-9]*$") then . else error("Invalid issue number") end)
+            | unique
+          ' <<< "$BATCH")
+          echo "issues=$issues" >> "$GITHUB_OUTPUT"
+
+  triage:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        issue: ${{ fromJSON(needs.prepare.outputs.issues) }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      NUMBER: ${{ matrix.issue }}
+      DECISION: ${{ inputs.decision }}
+      REASON: ${{ inputs.reason }}
+      TARGET_REPOSITORY: ${{ inputs.target_repository }}
+    steps:
+      - name: Create target repository token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.SECURITY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SECURITY_APP_PRIVATE_KEY }}
+          owner: ${{ needs.prepare.outputs.owner }}
+          repositories: ${{ needs.prepare.outputs.repo }}
+          permission-issues: write
+      - name: Check live issue state
+        id: check
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          [[ "$NUMBER" =~ ^[1-9][0-9]*$ && "$REASON" =~ [^[:space:]] ]]
+          [[ "$DECISION" == false-positive || "$DECISION" == remediate ]]
+          issue=$(gh api "repos/$TARGET_REPOSITORY/issues/$NUMBER")
+          jq -e '
+            (.pull_request == null) and
+            (.user.login | endswith("[bot]")) and
+            any(.labels[]; .name == "security-finding") and
+            (.body | test("<!-- port-finding:npm-v1:[a-f0-9]{64} -->"))
+          ' <<< "$issue" > /dev/null
+
+          assigned=$(jq -r 'any(.assignees[]; .login == "copilot-swe-agent[bot]")' <<< "$issue")
+          suppressed=$(jq -r 'any(.labels[]; .name == "security-false-positive")' <<< "$issue")
+          state=$(jq -r .state <<< "$issue")
+
+          if [[ "$DECISION" == false-positive ]]; then
+            [[ "$assigned" == false ]] || {
+              echo "Review and stop the existing agent task before marking false positive."
+              exit 1
+            }
+          else
+            [[ "$state" == open && "$suppressed" == false ]] || {
+              echo "Only an open, unsuppressed finding can be assigned."
+              exit 1
+            }
+          fi
+          echo "assigned=$assigned" >> "$GITHUB_OUTPUT"
+          if [[ "$DECISION" == remediate && "$assigned" == false ]]; then
+            branch=$(gh api "repos/$TARGET_REPOSITORY" --jq .default_branch)
+            [[ -n "$branch" ]]
+            echo "default_branch=$branch" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save false-positive decision and close issue
+        if: inputs.decision == 'false-positive'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          endpoint="repos/$TARGET_REPOSITORY/issues/$NUMBER"
+          jq -n '{labels:["security-false-positive"]}' |
+            gh api --method POST "$endpoint/labels" --input - > /dev/null
+          gh api --method PATCH "$endpoint" -f state=closed -f state_reason=not_planned > /dev/null
+
+      - name: Assign the confirmed issue to Copilot
+        if: inputs.decision == 'remediate' && steps.check.outputs.assigned == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_USER_TOKEN }}
+          DEFAULT_BRANCH: ${{ steps.check.outputs.default_branch }}
+        run: |
+          : "${GH_TOKEN:?Configure the approved Copilot user token first}"
+          jq -n --arg repo "$TARGET_REPOSITORY" --arg branch "$DEFAULT_BRANCH" --arg reason "$REASON" '
+            {
+              assignees: ["copilot-swe-agent[bot]"],
+              agent_assignment: {
+                target_repo: $repo,
+                base_branch: $branch,
+                custom_instructions: ("Fix the confirmed dependency advisory. Keep changes scoped, run the relevant tests, and link the issue in the PR. Reviewer context: " + $reason)
+              }
+            }
+          ' | gh api --method POST -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/$TARGET_REPOSITORY/issues/$NUMBER/assignees" --input - |
+            jq -e 'any(.assignees[]; .login == "copilot-swe-agent[bot]")' > /dev/null

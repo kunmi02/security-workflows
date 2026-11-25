@@ -1,0 +1,132 @@
+name: Port dependency scan
+run-name: Dependency scan / Port ${{ inputs.port_run_id || 'manual' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repository:
+        description: Onboarded target repository (owner/name)
+        type: string
+        required: true
+      minimum_severity:
+        description: Minimum advisory severity to publish
+        type: choice
+        options: [low, moderate, high, critical]
+        default: high
+      port_run_id:
+        description: Optional Port run identifier for correlation
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: port-dependency-scan-${{ inputs.target_repository }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    outputs:
+      owner: ${{ steps.target.outputs.owner }}
+      repo: ${{ steps.target.outputs.repo }}
+      directory: ${{ steps.target.outputs.directory }}
+    steps:
+      - name: Validate target repository
+        id: target
+        shell: bash
+        env:
+          TARGET: ${{ inputs.target_repository }}
+          REPOSITORIES: ${{ vars.SECURITY_SCAN_REPOSITORIES }}
+        run: |
+          [[ "$TARGET" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          directory=$(jq -er --arg target "$TARGET" '.[$target] | strings' <<< "$REPOSITORIES")
+          [[ "$directory" == "." || "$directory" =~ ^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$ ]]
+          echo "owner=${TARGET%/*}" >> "$GITHUB_OUTPUT"
+          echo "repo=${TARGET#*/}" >> "$GITHUB_OUTPUT"
+          echo "directory=$directory" >> "$GITHUB_OUTPUT"
+  scan:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Create target repository token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.SECURITY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SECURITY_APP_PRIVATE_KEY }}
+          owner: ${{ needs.prepare.outputs.owner }}
+          repositories: ${{ needs.prepare.outputs.repo }}
+          permission-contents: read
+      - name: Check out target repository
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.target_repository }}
+          token: ${{ steps.app.outputs.token }}
+          path: target-source
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Run dependency audit
+        shell: bash
+        env:
+          SCAN_DIRECTORY: ${{ needs.prepare.outputs.directory }}
+        run: |
+          status=0
+          if [[ ! -f "target-source/$SCAN_DIRECTORY/package-lock.json" ]]; then
+            echo "::error::Expected the committed npm lockfile at target-source/$SCAN_DIRECTORY/package-lock.json"
+            exit 1
+          fi
+          (cd "target-source/$SCAN_DIRECTORY" && npm audit --json --package-lock-only --ignore-scripts --audit-level=low) > npm-audit.json || status=$?
+          if [ "$status" -gt 1 ]; then exit "$status"; fi
+          node .github/scripts/publish-findings.mjs --validate npm-audit.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-audit
+          path: npm-audit.json
+          retention-days: 1
+
+  publish:
+    needs: [prepare, scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-audit
+          path: audit-results
+      - name: Create target repository token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.SECURITY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SECURITY_APP_PRIVATE_KEY }}
+          owner: ${{ needs.prepare.outputs.owner }}
+          repositories: ${{ needs.prepare.outputs.repo }}
+          permission-issues: write
+      - name: Publish findings and skip reviewed false positives
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository }}
+          AUDIT_LOCKFILE: ${{ needs.prepare.outputs.directory }}/package-lock.json
+          MINIMUM_SEVERITY: ${{ inputs.minimum_severity }}
+        run: |
+          TARGET_REPOSITORY_ID=$(gh api "repos/$TARGET_REPOSITORY" --jq .id)
+          export TARGET_REPOSITORY_ID
+          node .github/scripts/publish-findings.mjs audit-results/npm-audit.json
