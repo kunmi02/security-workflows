@@ -87,6 +87,8 @@ jobs:
       DECISION: ${{ inputs.decision }}
       REASON: ${{ inputs.reason }}
       TARGET_REPOSITORY: ${{ inputs.target_repository }}
+    permissions:
+      contents: read
     steps:
       - name: Create target repository token
         id: app
@@ -97,6 +99,7 @@ jobs:
           owner: ${{ needs.prepare.outputs.owner }}
           repositories: ${{ needs.prepare.outputs.repo }}
           permission-issues: write
+          permission-contents: read
       - name: Check live issue state
         id: check
         env:
@@ -122,6 +125,7 @@ jobs:
               exit 1
             }
           else
+            [[ "$assigned" == false ]] || { echo "::error::This issue already has an active Copilot assignment."; exit 1; }
             [[ "$state" == open && "$suppressed" == false ]] || {
               echo "Only an open, unsuppressed finding can be assigned."
               exit 1
@@ -132,6 +136,12 @@ jobs:
             branch=$(gh api "repos/$TARGET_REPOSITORY" --jq .default_branch)
             [[ -n "$branch" ]]
             echo "default_branch=$branch" >> "$GITHUB_OUTPUT"
+            body=$(jq -er .body <<< "$issue")
+            package=$(sed -n 's/^Package: //p' <<< "$body")
+            advisory=$(sed -n 's/^npm advisory: //p' <<< "$body")
+            [[ "$package" =~ ^(@[a-z0-9._-]+/)?[a-z0-9._-]+$ && "$advisory" =~ ^[0-9]+$ ]]
+            echo "package=$package" >> "$GITHUB_OUTPUT"
+            echo "advisory=$advisory" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Save false-positive decision and close issue
@@ -144,22 +154,166 @@ jobs:
             gh api --method POST "$endpoint/labels" --input - > /dev/null
           gh api --method PATCH "$endpoint" -f state=closed -f state_reason=not_planned > /dev/null
 
-      - name: Assign the confirmed issue to Copilot
-        if: inputs.decision == 'remediate' && steps.check.outputs.assigned == 'false'
+      - name: Check out selected repository
+        if: inputs.decision == 'remediate'
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.target_repository }}
+          ref: ${{ steps.check.outputs.default_branch }}
+          token: ${{ steps.app.outputs.token }}
+          persist-credentials: false
+
+      - name: Set up npm
+        if: inputs.decision == 'remediate'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Find the selected advisory in a committed lockfile
+        if: inputs.decision == 'remediate'
         env:
-          GH_TOKEN: ${{ secrets.COPILOT_USER_TOKEN }}
-          DEFAULT_BRANCH: ${{ steps.check.outputs.default_branch }}
+          PACKAGE: ${{ steps.check.outputs.package }}
+          ADVISORY: ${{ steps.check.outputs.advisory }}
         run: |
-          : "${GH_TOKEN:?Configure the approved Copilot user token first}"
-          jq -n --arg repo "$TARGET_REPOSITORY" --arg branch "$DEFAULT_BRANCH" --arg reason "$REASON" '
-            {
-              assignees: ["copilot-swe-agent[bot]"],
-              agent_assignment: {
-                target_repo: $repo,
-                base_branch: $branch,
-                custom_instructions: ("Fix the confirmed dependency advisory. Keep changes scoped, run the relevant tests, and link the issue in the PR. Reviewer context: " + $reason)
-              }
-            }
-          ' | gh api --method POST -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "repos/$TARGET_REPOSITORY/issues/$NUMBER/assignees" --input - |
-            jq -e 'any(.assignees[]; .login == "copilot-swe-agent[bot]")' > /dev/null
+          mkdir "$RUNNER_TEMP/remediation"
+          matches=()
+          while IFS= read -r -d '' lockfile; do
+            directory=$(dirname -- "$lockfile")
+            [[ ! -L "$lockfile" && -f "$directory/package.json" && ! -L "$directory/package.json" ]]
+            status=0
+            (cd "$directory" && npm audit --json --package-lock-only --ignore-scripts --audit-level=low) > "$RUNNER_TEMP/current-audit.json" || status=$?
+            [[ "$status" -le 1 ]]
+            jq -e '.auditReportVersion == 2 and (.vulnerabilities | type == "object")' "$RUNNER_TEMP/current-audit.json" >/dev/null
+            if jq -e --arg p "$PACKAGE" --arg a "$ADVISORY" 'any(.vulnerabilities[$p].via[]?; type == "object" and (.source | tostring) == $a)' "$RUNNER_TEMP/current-audit.json" >/dev/null; then
+              matches+=("$directory")
+              cp "$RUNNER_TEMP/current-audit.json" "$RUNNER_TEMP/before-audit.json"
+            fi
+          done < <(git ls-files -z -- 'package-lock.json' ':(glob)**/package-lock.json')
+          if [[ "${#matches[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one lockfile with the selected advisory. Review the finding manually."
+            exit 1
+          fi
+          printf '%s' "${matches[0]}" > "$RUNNER_TEMP/remediation/directory"
+          git rev-parse HEAD > "$RUNNER_TEMP/remediation/base"
+
+      - name: Ask Gemini to assess the compatible npm fix
+        if: inputs.decision == 'remediate'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
+          PACKAGE: ${{ steps.check.outputs.package }}
+          ADVISORY: ${{ steps.check.outputs.advisory }}
+        run: |
+          : "${GEMINI_API_KEY:?Set GEMINI_API_KEY in security-workflows}"
+          [[ "$GEMINI_MODEL" =~ ^[A-Za-z0-9._-]+$ ]]
+          jq -c --arg p "$PACKAGE" --arg a "$ADVISORY" '
+            .vulnerabilities[$p] as $v
+            | {contents:[{parts:[{text: ("Review this npm advisory and decide whether to attempt a compatible npm audit fix without --force. Respond with exactly APPLY or MANUAL. Use MANUAL if npm does not indicate an available non-major fix. Metadata: " + ({package:$p, advisory:$a, fixAvailable:($v.fixAvailable | if type == "object" then {isSemVerMajor} else . end)} | tojson))}]}]}
+          ' "$RUNNER_TEMP/before-audit.json" |
+            curl -fsS --max-time 60 -H "x-goog-api-key: $GEMINI_API_KEY" -H 'Content-Type: application/json' \
+              --data-binary @- "https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL:generateContent" \
+              > "$RUNNER_TEMP/gemini-response.json"
+          decision=$(jq -er '[.candidates[0].content.parts[] | select(.thought != true) | .text] | join("") | gsub("^\\s+|\\s+$"; "")' "$RUNNER_TEMP/gemini-response.json")
+          if [[ "$decision" != APPLY ]] || ! jq -e --arg p "$PACKAGE" '
+            .vulnerabilities[$p].fixAvailable | . == true or (type == "object" and .isSemVerMajor == false)
+          ' "$RUNNER_TEMP/before-audit.json" >/dev/null; then
+            echo "::error::No compatible fix was approved. Review this issue manually."
+            exit 1
+          fi
+
+      - name: Apply and verify the dependency patch
+        if: inputs.decision == 'remediate'
+        env:
+          PACKAGE: ${{ steps.check.outputs.package }}
+          ADVISORY: ${{ steps.check.outputs.advisory }}
+        run: |
+          directory=$(cat "$RUNNER_TEMP/remediation/directory")
+          status=0
+          (cd "$directory" && npm audit fix --package-lock-only --ignore-scripts --audit-level=low) || status=$?
+          [[ "$status" -le 1 ]]
+          status=0
+          (cd "$directory" && npm audit --json --package-lock-only --ignore-scripts --audit-level=low) > "$RUNNER_TEMP/after-audit.json" || status=$?
+          [[ "$status" -le 1 ]]
+          jq -e --arg p "$PACKAGE" --arg a "$ADVISORY" '
+            .auditReportVersion == 2 and (.vulnerabilities | type == "object") and
+            (any(.vulnerabilities[$p].via[]?; type == "object" and (.source | tostring) == $a) | not)
+          ' "$RUNNER_TEMP/after-audit.json" >/dev/null
+          prefix=""
+          if [[ "$directory" != "." ]]; then prefix="$directory/"; fi
+          git diff --quiet -- . ":(exclude,literal)${prefix}package.json" ":(exclude,literal)${prefix}package-lock.json"
+          git diff --binary -- "${prefix}package.json" "${prefix}package-lock.json" > "$RUNNER_TEMP/remediation/change.patch"
+          [[ -s "$RUNNER_TEMP/remediation/change.patch" ]]
+          (cd "$directory" && npm ci --ignore-scripts --no-audit && npm run test --if-present)
+          git diff --quiet -- . ":(exclude,literal)${prefix}package.json" ":(exclude,literal)${prefix}package-lock.json"
+          git diff --binary -- "${prefix}package.json" "${prefix}package-lock.json" | cmp - "$RUNNER_TEMP/remediation/change.patch"
+
+      - name: Upload verified patch
+        if: inputs.decision == 'remediate'
+        uses: actions/upload-artifact@v4
+        with:
+          name: remediation-${{ matrix.issue }}
+          path: ${{ runner.temp }}/remediation
+          retention-days: 1
+
+  publish_remediation:
+    if: inputs.decision == 'remediate'
+    needs: [prepare, triage]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        issue: ${{ fromJSON(needs.prepare.outputs.issues) }}
+    env:
+      TARGET_REPOSITORY: ${{ inputs.target_repository }}
+      NUMBER: ${{ matrix.issue }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: remediation-${{ matrix.issue }}
+          path: ${{ runner.temp }}/remediation
+      - name: Create target repository publishing token
+        id: writer
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.SECURITY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SECURITY_APP_PRIVATE_KEY }}
+          owner: ${{ needs.prepare.outputs.owner }}
+          repositories: ${{ needs.prepare.outputs.repo }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: read
+      - name: Check out selected repository
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.target_repository }}
+          token: ${{ steps.writer.outputs.token }}
+          persist-credentials: false
+      - name: Open a draft pull request
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.writer.outputs.token }}
+        run: |
+          branch="port/remediate-issue-$NUMBER"
+          existing=$(gh pr list --repo "$TARGET_REPOSITORY" --head "$branch" --state open --json url --jq '.[0].url // empty')
+          if [[ -n "$existing" ]]; then echo "$existing"; exit 0; fi
+          issue=$(gh api "repos/$TARGET_REPOSITORY/issues/$NUMBER")
+          jq -e '.state == "open" and any(.labels[]; .name == "security-finding") and all(.labels[]; .name != "security-false-positive")' <<< "$issue" >/dev/null
+          [[ "$(git rev-parse HEAD)" == "$(cat "$RUNNER_TEMP/remediation/base")" ]] || {
+            echo "::error::Default branch changed after verification. Run triage again."
+            exit 1
+          }
+          directory=$(cat "$RUNNER_TEMP/remediation/directory")
+          [[ "$directory" == "." || "$directory" =~ ^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$ ]]
+          prefix=""
+          if [[ "$directory" != "." ]]; then prefix="$directory/"; fi
+          git apply --index --include="${prefix}package.json" --include="${prefix}package-lock.json" "$RUNNER_TEMP/remediation/change.patch"
+          git diff --cached --quiet && { echo "::error::No verified dependency changes."; exit 1; }
+          git switch -c "$branch"
+          git -c user.name='Port Security' -c user.email='port-security@users.noreply.github.com' commit -m "Fix npm dependency finding #$NUMBER"
+          gh auth setup-git
+          git push origin "HEAD:refs/heads/$branch"
+          gh pr create --repo "$TARGET_REPOSITORY" --head "$branch" --draft \
+            --title "Fix npm dependency finding #$NUMBER" \
+            --body "$(printf 'Fixes #%s\n\nThe selected npm advisory was absent on rescan. npm ci completed, and the package test script ran if present. Review the dependency diff before merging.' "$NUMBER")"
