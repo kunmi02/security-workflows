@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       target_repository:
-        description: Onboarded target repository (owner/name)
+        description: Target repository (owner/name)
         type: string
         required: true
       issue_number:
@@ -39,7 +39,6 @@ jobs:
     outputs:
       owner: ${{ steps.target.outputs.owner }}
       repo: ${{ steps.target.outputs.repo }}
-      directory: ${{ steps.target.outputs.directory }}
       issues: ${{ steps.parse.outputs.issues }}
     steps:
       - name: Validate target repository
@@ -47,14 +46,10 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ inputs.target_repository }}
-          REPOSITORIES: ${{ vars.SECURITY_SCAN_REPOSITORIES }}
         run: |
           [[ "$TARGET" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
-          directory=$(jq -er --arg target "$TARGET" '.[$target] | strings' <<< "$REPOSITORIES")
-          [[ "$directory" == "." || "$directory" =~ ^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$ ]]
           echo "owner=${TARGET%/*}" >> "$GITHUB_OUTPUT"
           echo "repo=${TARGET#*/}" >> "$GITHUB_OUTPUT"
-          echo "directory=$directory" >> "$GITHUB_OUTPUT"
       - id: parse
         shell: bash
         env:

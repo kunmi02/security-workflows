@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       target_repository:
-        description: Onboarded target repository (owner/name)
+        description: Target repository (owner/name)
         type: string
         required: true
       minimum_severity:
@@ -30,21 +30,16 @@ jobs:
     outputs:
       owner: ${{ steps.target.outputs.owner }}
       repo: ${{ steps.target.outputs.repo }}
-      directory: ${{ steps.target.outputs.directory }}
     steps:
       - name: Validate target repository
         id: target
         shell: bash
         env:
           TARGET: ${{ inputs.target_repository }}
-          REPOSITORIES: ${{ vars.SECURITY_SCAN_REPOSITORIES }}
         run: |
           [[ "$TARGET" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
-          directory=$(jq -er --arg target "$TARGET" '.[$target] | strings' <<< "$REPOSITORIES")
-          [[ "$directory" == "." || "$directory" =~ ^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$ ]]
           echo "owner=${TARGET%/*}" >> "$GITHUB_OUTPUT"
           echo "repo=${TARGET#*/}" >> "$GITHUB_OUTPUT"
-          echo "directory=$directory" >> "$GITHUB_OUTPUT"
   scan:
     needs: prepare
     runs-on: ubuntu-latest
@@ -76,21 +71,27 @@ jobs:
           package-manager-cache: false
       - name: Run dependency audit
         shell: bash
-        env:
-          SCAN_DIRECTORY: ${{ needs.prepare.outputs.directory }}
         run: |
-          status=0
-          if [[ ! -f "target-source/$SCAN_DIRECTORY/package-lock.json" ]]; then
-            echo "::error::Expected the committed npm lockfile at target-source/$SCAN_DIRECTORY/package-lock.json"
+          mkdir audit-results
+          count=0
+          while IFS= read -r -d '' lockfile; do
+            [[ -f "target-source/$lockfile" && ! -L "target-source/$lockfile" ]]
+            directory=$(dirname -- "$lockfile")
+            count=$((count + 1))
+            status=0
+            (cd "target-source/$directory" && npm audit --json --package-lock-only --ignore-scripts --audit-level=low) > "audit-results/$count.json" || status=$?
+            if [ "$status" -gt 1 ]; then exit "$status"; fi
+            node .github/scripts/publish-findings.mjs --validate "audit-results/$count.json"
+            printf '%s' "$lockfile" > "audit-results/$count.lockfile"
+          done < <(git -C target-source ls-files -z -- 'package-lock.json' ':(glob)**/package-lock.json')
+          if [[ "$count" -eq 0 ]]; then
+            echo "::error::No committed npm package-lock.json found in the target repository."
             exit 1
           fi
-          (cd "target-source/$SCAN_DIRECTORY" && npm audit --json --package-lock-only --ignore-scripts --audit-level=low) > npm-audit.json || status=$?
-          if [ "$status" -gt 1 ]; then exit "$status"; fi
-          node .github/scripts/publish-findings.mjs --validate npm-audit.json
       - uses: actions/upload-artifact@v4
         with:
           name: npm-audit
-          path: npm-audit.json
+          path: audit-results
           retention-days: 1
 
   publish:
@@ -124,9 +125,12 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           TARGET_REPOSITORY: ${{ inputs.target_repository }}
-          AUDIT_LOCKFILE: ${{ needs.prepare.outputs.directory }}/package-lock.json
           MINIMUM_SEVERITY: ${{ inputs.minimum_severity }}
         run: |
           TARGET_REPOSITORY_ID=$(gh api "repos/$TARGET_REPOSITORY" --jq .id)
           export TARGET_REPOSITORY_ID
-          node .github/scripts/publish-findings.mjs audit-results/npm-audit.json
+          for report in audit-results/*.json; do
+            AUDIT_LOCKFILE=$(cat "${report%.json}.lockfile")
+            export AUDIT_LOCKFILE
+            node .github/scripts/publish-findings.mjs "$report"
+          done
