@@ -32,9 +32,12 @@ export function readAdvisories(report) {
 }
 
 export function fingerprint(repositoryId, advisory) {
-  // Keep the original single-lockfile key so existing suppressions still match.
+  // Preserve the original MatchVault frontend key for existing suppressions.
+  const lockfile = process.env.AUDIT_LOCKFILE ?? 'package-lock.json';
+  const scope = process.env.TARGET_REPOSITORY === 'kunmi02/matchvault' &&
+    lockfile === 'frontend/package-lock.json' ? 'package-lock.json' : lockfile;
   return createHash('sha256').update(JSON.stringify([
-    'npm-v1', repositoryId, 'package-lock.json', advisory.name, advisory.source,
+    'npm-v1', repositoryId, scope, advisory.name, advisory.source,
   ])).digest('hex');
 }
 
